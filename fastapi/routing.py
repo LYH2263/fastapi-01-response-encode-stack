@@ -75,6 +75,14 @@ from fastapi.exceptions import (
     ResponseValidationError,
     WebSocketRequestValidationError,
 )
+from fastapi.response_policy import (
+    ValidationMode,
+    best_effort_construct,
+    bind_response_policy_stack,
+    get_pushed_response_policy,
+    lenient_serialization,
+    resolve_response_policy,
+)
 from fastapi.sse import (
     _PING_INTERVAL,
     KEEPALIVE_COMMENT,
@@ -96,6 +104,7 @@ from fastapi.utils import (
     get_value_or_default,
     is_body_allowed_for_status_code,
 )
+from fastapi.websockets import WebSocket
 from starlette import routing
 from starlette._exception_handler import wrap_app_handling_exceptions
 from starlette._utils import get_route_path, is_async_callable
@@ -120,7 +129,7 @@ from starlette.routing import (
 from starlette.routing import Mount as Mount  # noqa
 from starlette.staticfiles import StaticFiles
 from starlette.types import AppType, ASGIApp, Lifespan, Receive, Scope, Send
-from starlette.websockets import WebSocket
+from starlette.websockets import WebSocket as StarletteWebSocket
 from typing_extensions import deprecated
 
 
@@ -145,14 +154,20 @@ def request_response(
         async def app(scope: Scope, receive: Receive, send: Send) -> None:
             # Starts customization
             response_awaited = False
-            async with AsyncExitStack() as request_stack:
-                scope["fastapi_inner_astack"] = request_stack
-                async with AsyncExitStack() as function_stack:
-                    scope["fastapi_function_astack"] = function_stack
-                    response = await f(request)
-                await response(scope, receive, send)
-                # Continues customization
-                response_awaited = True
+            # Bind the request scoped response serialization policy stack.
+            # The bind covers the endpoint, the dependencies and the whole
+            # response (including streamed bodies); it is reset here before
+            # any exception handler runs. Background tasks explicitly opt in
+            # to an empty stack view when they run after the response is sent.
+            with bind_response_policy_stack():
+                async with AsyncExitStack() as request_stack:
+                    scope["fastapi_inner_astack"] = request_stack
+                    async with AsyncExitStack() as function_stack:
+                        scope["fastapi_function_astack"] = function_stack
+                        response = await f(request)
+                    await response(scope, receive, send)
+                    # Continues customization
+                    response_awaited = True
             if not response_awaited:
                 raise FastAPIError(
                     "Response not awaited. There's a high chance that the "
@@ -182,11 +197,16 @@ def websocket_session(
         session = WebSocket(scope, receive=receive, send=send)
 
         async def app(scope: Scope, receive: Receive, send: Send) -> None:
-            async with AsyncExitStack() as request_stack:
-                scope["fastapi_inner_astack"] = request_stack
-                async with AsyncExitStack() as function_stack:
-                    scope["fastapi_function_astack"] = function_stack
-                    await func(session)
+            # Bind the response serialization policy stack to this connection
+            # for its whole lifetime (the endpoint performs the WebSocket
+            # handshake itself; everything after a successful accept runs with
+            # the connection-owned stack bound).
+            with bind_response_policy_stack():
+                async with AsyncExitStack() as request_stack:
+                    scope["fastapi_inner_astack"] = request_stack
+                    async with AsyncExitStack() as function_stack:
+                        scope["fastapi_function_astack"] = function_stack
+                        await func(session)
 
         # Same as in Starlette
         await wrap_app_handling_exceptions(app, session)(scope, receive, send)
@@ -331,33 +351,62 @@ async def serialize_response(
     endpoint_ctx: EndpointContext | None = None,
     dump_json: bool = False,
 ) -> Any:
+    # Plain JSON exit point: the decorator values are the route baseline and
+    # the current request's policy stack is merged on top of it right here,
+    # once per response.
+    effective = resolve_response_policy(
+        by_alias=by_alias,
+        exclude_unset=exclude_unset,
+        exclude_defaults=exclude_defaults,
+        exclude_none=exclude_none,
+    )
     if field:
-        if is_coroutine:
-            value, errors = field.validate(response_content, {}, loc=("response",))
+        # strict: keep the response model validation pass and raise
+        # ResponseValidationError on errors. lenient: skip validation and
+        # serialize the raw payload, still honoring the other switches.
+        if effective.validation_mode is ValidationMode.strict:
+            if is_coroutine:
+                value, errors = field.validate(response_content, {}, loc=("response",))
+            else:
+                value, errors = await run_in_threadpool(
+                    field.validate, response_content, {}, loc=("response",)
+                )
+            if errors:
+                ctx = endpoint_ctx or EndpointContext()
+                raise ResponseValidationError(
+                    errors=errors,
+                    body=response_content,
+                    endpoint_ctx=ctx,
+                )
         else:
-            value, errors = await run_in_threadpool(
-                field.validate, response_content, {}, loc=("response",)
-            )
-        if errors:
-            ctx = endpoint_ctx or EndpointContext()
-            raise ResponseValidationError(
-                errors=errors,
-                body=response_content,
-                endpoint_ctx=ctx,
-            )
+            value = best_effort_construct(field, response_content)
         serializer = field.serialize_json if dump_json else field.serialize
+        if effective.validation_mode is ValidationMode.lenient:
+            with lenient_serialization():
+                return serializer(
+                    value,
+                    include=include,
+                    exclude=exclude,
+                    **effective.dump_kwargs,
+                )
         return serializer(
             value,
             include=include,
             exclude=exclude,
-            by_alias=by_alias,
-            exclude_unset=exclude_unset,
-            exclude_defaults=exclude_defaults,
-            exclude_none=exclude_none,
+            **effective.dump_kwargs,
         )
 
     else:
-        return jsonable_encoder(response_content)
+        # Keep the historical behavior bit-for-bit when no frame was pushed;
+        # a request that did push frames gets its merged switches applied.
+        if get_pushed_response_policy() is None:
+            return jsonable_encoder(response_content)
+        return jsonable_encoder(
+            response_content,
+            include=include,
+            exclude=exclude,
+            **effective.dump_kwargs,
+        )
 
 
 async def run_endpoint_function(
@@ -524,30 +573,62 @@ def get_request_handler(
         if not errors:
             # Shared serializer for stream items (JSONL and SSE).
             # Validates against stream_item_field when set, then
-            # serializes to JSON bytes.
+            # serializes to JSON bytes. This is called once per produced
+            # item, immediately before the item is written, and reads the
+            # request's policy stack at every call (never as a snapshot taken
+            # when the generator starts): pushes and pops done by the
+            # endpoint generator between items take effect item by item.
             def _serialize_data(data: Any) -> bytes:
+                effective = resolve_response_policy(
+                    by_alias=response_model_by_alias,
+                    exclude_unset=response_model_exclude_unset,
+                    exclude_defaults=response_model_exclude_defaults,
+                    exclude_none=response_model_exclude_none,
+                )
                 if stream_item_field:
-                    value, errors_ = stream_item_field.validate(
-                        data, {}, loc=("response",)
-                    )
-                    if errors_:
-                        ctx = endpoint_ctx or EndpointContext()
-                        raise ResponseValidationError(
-                            errors=errors_,
-                            body=data,
-                            endpoint_ctx=ctx,
+                    # strict keeps per-item response validation and raises
+                    # ResponseValidationError; lenient skips it while still
+                    # applying the serialization switches.
+                    if effective.validation_mode is ValidationMode.strict:
+                        value, errors_ = stream_item_field.validate(
+                            data, {}, loc=("response",)
                         )
+                        if errors_:
+                            ctx = endpoint_ctx or EndpointContext()
+                            raise ResponseValidationError(
+                                errors=errors_,
+                                body=data,
+                                endpoint_ctx=ctx,
+                            )
+                    else:
+                        value = best_effort_construct(stream_item_field, data)
+                    if effective.validation_mode is ValidationMode.lenient:
+                        with lenient_serialization():
+                            return stream_item_field.serialize_json(
+                                value,
+                                include=response_model_include,
+                                exclude=response_model_exclude,
+                                **effective.dump_kwargs,
+                            )
                     return stream_item_field.serialize_json(
                         value,
                         include=response_model_include,
                         exclude=response_model_exclude,
-                        by_alias=response_model_by_alias,
-                        exclude_unset=response_model_exclude_unset,
-                        exclude_defaults=response_model_exclude_defaults,
-                        exclude_none=response_model_exclude_none,
+                        **effective.dump_kwargs,
                     )
                 else:
-                    data = jsonable_encoder(data)
+                    # Preserve the exact historical encoding when the
+                    # generator never pushed a frame; otherwise apply the
+                    # switches of the merged stack top.
+                    if get_pushed_response_policy() is None:
+                        data = jsonable_encoder(data)
+                    else:
+                        data = jsonable_encoder(
+                            data,
+                            include=response_model_include,
+                            exclude=response_model_exclude,
+                            **effective.dump_kwargs,
+                        )
                     return json.dumps(_normalize_non_finite_floats(data)).encode(
                         "utf-8"
                     )
@@ -565,12 +646,35 @@ def get_request_handler(
                         if item.raw_data is not None:
                             data_str: str | None = item.raw_data
                         elif item.data is not None:
-                            if hasattr(item.data, "model_dump_json"):
-                                data_str = item.data.model_dump_json()
+                            # Read the stack per item, just like the plain
+                            # object branch: no startup-time snapshot.
+                            effective = resolve_response_policy(
+                                by_alias=response_model_by_alias,
+                                exclude_unset=response_model_exclude_unset,
+                                exclude_defaults=response_model_exclude_defaults,
+                                exclude_none=response_model_exclude_none,
+                            )
+                            if get_pushed_response_policy() is None:
+                                # Historical behavior with no pushed frame.
+                                if hasattr(item.data, "model_dump_json"):
+                                    data_str = item.data.model_dump_json()
+                                else:
+                                    data_str = json.dumps(
+                                        _normalize_non_finite_floats(
+                                            jsonable_encoder(item.data)
+                                        )
+                                    )
+                            elif hasattr(item.data, "model_dump_json"):
+                                data_str = item.data.model_dump_json(
+                                    **effective.dump_kwargs
+                                )
                             else:
                                 data_str = json.dumps(
                                     _normalize_non_finite_floats(
-                                        jsonable_encoder(item.data)
+                                        jsonable_encoder(
+                                            item.data,
+                                            **effective.dump_kwargs,
+                                        )
                                     )
                                 )
                         else:
@@ -584,7 +688,8 @@ def get_request_handler(
                         )
                     else:
                         # Plain object: validate + serialize via
-                        # stream_item_field (if set) and wrap in data field
+                        # stream_item_field (if set) and wrap in data field.
+                        # _serialize_data reads the current stack top itself.
                         return format_sse_event(
                             data_str=_serialize_data(item).decode("utf-8")
                         )
@@ -2696,7 +2801,16 @@ class APIRouter(routing.Router):
         endpoint: Callable[[WebSocket], Awaitable[None]],
         name: str | None = None,
     ) -> None:
-        super().add_websocket_route(path, endpoint, name=name)
+        # The stored endpoint receives Starlette connections on the wire; the
+        # route wrapper (websocket_session) hands it a FastAPI WebSocket.
+        super().add_websocket_route(
+            path,
+            cast(
+                "Callable[[StarletteWebSocket], Awaitable[None]]",
+                endpoint,
+            ),
+            name=name,
+        )
         self._mark_routes_changed()
 
     def frontend(

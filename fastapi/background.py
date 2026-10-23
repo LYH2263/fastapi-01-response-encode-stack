@@ -2,6 +2,7 @@ from collections.abc import Callable
 from typing import Annotated, Any
 
 from annotated_doc import Doc
+from fastapi.response_policy import response_policy_stack_empty
 from fastapi.telemetry._api import _operation
 from starlette.background import BackgroundTasks as StarletteBackgroundTasks
 from typing_extensions import ParamSpec
@@ -62,6 +63,11 @@ class BackgroundTasks(StarletteBackgroundTasks):
         return super().add_task(func, *args, **kwargs)
 
     async def __call__(self) -> None:
-        for task in self.tasks:
-            with _operation(name="background_task", function=task.func):
-                await task()
+        # Background tasks run after the response has been handed to the
+        # client: they must observe an empty response serialization policy
+        # stack, including frames the request that scheduled them forgot to
+        # pop. Frames pushed by the tasks themselves are discarded on exit.
+        with response_policy_stack_empty():
+            for task in self.tasks:
+                with _operation(name="background_task", function=task.func):
+                    await task()
